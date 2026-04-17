@@ -1,9 +1,13 @@
 // ============================================================
-//  Java / Spring Boot service pipeline
+//  Node.js / Express service pipeline
 //  Replace api-gateway and zomato-api-gateway when splitting
 // ============================================================
 pipeline {
     agent any
+
+    tools {
+        nodejs 'NodeJS-22'
+    }
 
     environment {
         SERVICE_NAME    = 'api-gateway'
@@ -13,12 +17,12 @@ pipeline {
         IMAGE_TAG       = "${env.BUILD_NUMBER}-${env.GIT_COMMIT.take(7)}"
         FULL_IMAGE      = "${DOCKER_REGISTRY}/zomato-${SERVICE_NAME}"
         DOCKER_BUILDKIT = '1'
-        MAVEN_OPTS      = '-Dmaven.repo.local=.m2/repository'
+        npm_config_cache = "${WORKSPACE}/.npm-cache"
     }
 
     options {
         buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '5'))
-        timeout(time: 30, unit: 'MINUTES')
+        timeout(time: 20, unit: 'MINUTES')
         timestamps()
         disableConcurrentBuilds(abortPrevious: true)
         skipStagesAfterUnstable()
@@ -56,54 +60,70 @@ pipeline {
             }
         }
 
-        // ==================== UNIT TESTS + COVERAGE ====================
+        // ==================== INSTALL ====================
+        stage('Install') {
+            steps {
+                sh 'npm ci --prefer-offline'
+            }
+        }
+
+        // ==================== PARALLEL: LINT + AUDIT ====================
+        stage('Quality Checks') {
+            parallel {
+                stage('Lint') {
+                    steps {
+                        script {
+                            def hasLint = sh(script: 'node -e "const p=require(\'./package.json\'); process.exit(p.scripts && p.scripts.lint ? 0 : 1)"', returnStatus: true) == 0
+                            if (hasLint) {
+                                sh 'npm run lint'
+                            } else {
+                                echo "No lint script — skipping"
+                            }
+                        }
+                    }
+                }
+                stage('Dependency Audit') {
+                    steps {
+                        sh 'npm audit --audit-level=critical || true'
+                        sh 'npm audit --json > npm-audit-report.json 2>/dev/null || true'
+                        archiveArtifacts artifacts: 'npm-audit-report.json', allowEmptyArchive: true
+                    }
+                }
+            }
+        }
+
+        // ==================== UNIT TESTS ====================
         stage('Unit Tests') {
             steps {
-                sh 'chmod +x mvnw 2>/dev/null || true'
-                sh './mvnw test -B jacoco:report'
+                script {
+                    def hasTest = sh(script: 'node -e "const p=require(\'./package.json\'); process.exit(p.scripts && p.scripts.test ? 0 : 1)"', returnStatus: true) == 0
+                    if (hasTest) {
+                        def hasCoverage = sh(script: 'node -e "const p=require(\'./package.json\'); process.exit(p.scripts && p.scripts[\'test:coverage\'] ? 0 : 1)"', returnStatus: true) == 0
+                        if (hasCoverage) {
+                            sh 'npm run test:coverage'
+                        } else {
+                            sh 'npm test'
+                        }
+                    } else {
+                        echo "No test script — skipping"
+                    }
+                }
             }
             post {
                 always {
-                    junit testResults: 'target/surefire-reports/*.xml', allowEmptyResults: true
-                    jacoco(
-                        execPattern: 'target/jacoco.exec',
-                        classPattern: 'target/classes',
-                        sourcePattern: 'src/main/java',
-                        exclusionPattern: '**/dto/**,**/config/**,**/entity/**'
+                    junit testResults: '**/junit*.xml', allowEmptyResults: true
+                    cobertura(
+                        coberturaReportFile: '**/coverage/cobertura-coverage.xml',
+                        failNoReports: false
                     )
                 }
             }
         }
 
-        // ==================== CODE QUALITY (SonarQube — optional) ====================
-        stage('Code Quality') {
-            when {
-                expression {
-                    try {
-                        withCredentials([string(credentialsId: 'sonarqube-url', variable: 'SONAR_URL')]) { return true }
-                    } catch (Exception e) {
-                        return false
-                    }
-                }
-            }
-            steps {
-                withCredentials([string(credentialsId: 'sonarqube-url', variable: 'SONAR_URL')]) {
-                    sh """
-                        ./mvnw sonar:sonar \
-                            -Dsonar.host.url=\${SONAR_URL} \
-                            -Dsonar.projectKey=${REPO_NAME} \
-                            -Dsonar.qualitygate.wait=true \
-                            -B
-                    """
-                }
-            }
-        }
-
-        // ==================== BUILD JAR ====================
+        // ==================== BUILD ====================
         stage('Build') {
             steps {
-                sh './mvnw package -DskipTests -B'
-                archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
+                sh 'npm run build'
             }
         }
 
@@ -125,7 +145,7 @@ pipeline {
             }
         }
 
-        // ==================== SECURITY SCAN (Trivy) ====================
+        // ==================== SECURITY SCAN ====================
         stage('Security Scan') {
             steps {
                 script {
@@ -206,30 +226,28 @@ pipeline {
             }
         }
 
-        // ==================== SMOKE TESTS (staging) ====================
-        stage('Smoke Tests') {
+        // ==================== STAGING DEPLOY + SMOKE ====================
+        stage('Deploy to Staging') {
             when { branch 'main' }
             steps {
                 script {
-                    echo "Deploying ${SERVICE_NAME}:${env.ENV_IMAGE_TAG} to STAGING for smoke tests..."
+                    echo "Deploying ${SERVICE_NAME}:${env.ENV_IMAGE_TAG} to STAGING..."
                     sshagent(['staging-ssh-key']) {
                         sh """
                             ssh -o StrictHostKeyChecking=no deployer@\${STAGING_SERVER} \
                                 'cd /opt/zomato && ./deploy.sh ${SERVICE_NAME} ${env.ENV_IMAGE_TAG} prod'
                         """
                     }
-                    // Verify health after staging deploy
                     retry(5) {
                         sleep(time: 10, unit: 'SECONDS')
                         sh """
                             HTTP_CODE=\$(curl -s -o /dev/null -w '%{http_code}' \
-                                --max-time 10 \
-                                http://\${STAGING_SERVER}:\${STAGING_PORT}/actuator/health)
+                                --max-time 10 http://\${STAGING_SERVER}:\${STAGING_PORT}/health)
                             if [ "\$HTTP_CODE" != "200" ]; then
-                                echo "Health check returned \$HTTP_CODE"
+                                echo "Staging health check returned \$HTTP_CODE"
                                 exit 1
                             fi
-                            echo "Health check passed (HTTP \$HTTP_CODE)"
+                            echo "Staging health check passed"
                         """
                     }
                 }
